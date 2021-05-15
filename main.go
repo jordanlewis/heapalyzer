@@ -32,6 +32,7 @@ import (
 
 var debug = flag.Bool("debug", false, "debug")
 var cpuprofile = flag.String("cpuprofile", "", "write cpu prof")
+var goroutineid = flag.Int("goroutine", -1, "only analyze this goroutine id")
 
 func main() {
 	flag.Parse()
@@ -120,7 +121,7 @@ func (a *analyzer) analyze() error {
 		return err
 	}
 	for _, g := range gs {
-		if g.ID != 3676 {
+		if *goroutineid != -1 && g.ID != *goroutineid {
 			continue
 		}
 		trace, err := a.debugger.Stacktrace(g.ID, 1000, 0)
