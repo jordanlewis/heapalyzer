@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/dustin/go-humanize"
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
@@ -71,8 +72,9 @@ type Var struct {
 }
 
 type objCounts struct {
-	count int
-	size  int64
+	count        int
+	size         int64
+	retainedSize int64
 }
 
 type analyzer struct {
@@ -84,7 +86,10 @@ type analyzer struct {
 		// Map from object pointer to whether we've seen it or not
 		seen map[uint64]bool
 		// Map from string "type" to counts
-		objectMap map[godwarf.Type]*objCounts
+		objectMap map[string]*objCounts
+
+		hitCount int
+		varCount int
 	}
 
 	varDepth int
@@ -97,7 +102,18 @@ type analyzer struct {
 
 func (a *analyzer) analyze() error {
 	a.mu.seen = make(map[uint64]bool)
-	a.mu.objectMap = make(map[godwarf.Type]*objCounts)
+	a.mu.objectMap = make(map[string]*objCounts)
+
+	start := time.Now()
+	packageVars, err := a.debugger.PackageVariables("", proc.LoadConfig{})
+	if err != nil {
+		return err
+	}
+	for _, v := range packageVars {
+		a.processVar(v)
+	}
+	fmt.Println("processed package vars in", time.Since(start))
+	start = time.Now()
 
 	gs, _, err := a.debugger.Goroutines(0, 100000)
 	if err != nil {
@@ -123,16 +139,17 @@ func (a *analyzer) analyze() error {
 			a.frameIdx = i
 			a.frame = &frame
 			for _, v := range locals {
-				a.processVar(v.Name, v)
+				a.processVar(v)
 			}
 		}
 	}
+	fmt.Println("processed goroutines in", time.Since(start))
 	fmt.Println("COUNTS PER TYPE")
 	fmt.Println("---------------")
 	fmt.Println()
 
 	type objectSorters struct {
-		typ godwarf.Type
+		typ string
 		objCounts
 	}
 	objects := make([]objectSorters, len(a.mu.objectMap))
@@ -144,10 +161,18 @@ func (a *analyzer) analyze() error {
 		}
 		i++
 	}
-	sort.Slice(objects, func(i, j int) bool { return objects[i].size < objects[j].size })
+	sort.Slice(objects, func(i, j int) bool { return objects[i].retainedSize < objects[j].retainedSize })
+	var total int64
 	for _, o := range objects {
-		fmt.Printf("%5d (%5s) -> %s\n", o.count, humanize.Bytes(uint64(o.size)), o.typ)
+		fmt.Printf("%5d (%5s) (%5s) -> %s\n", o.count,
+			humanize.Bytes(uint64(o.size)),
+			humanize.Bytes(uint64(o.retainedSize)),
+			o.typ)
+		total += o.size
 	}
+
+	fmt.Println("Total size", humanize.Bytes(uint64(total)))
+	fmt.Printf("processed %d objects, %d dupes\n", a.mu.varCount, a.mu.hitCount)
 	return nil
 }
 
@@ -164,114 +189,155 @@ func init() {
 }
 
 // processVar recurses down a variable, processing it and any children.
-func (a *analyzer) processVar(curName string, v *proc.Variable) {
+// It returns the retained size of the variable, which is the sum of its own
+// size plus its children's size, recursively.
+func (a *analyzer) processVar(v *proc.Variable) int64 {
+	a.mu.varCount++
 	a.varDepth++
 	defer func() { a.varDepth-- }()
 	if *debug {
-		fmt.Printf("%sprocessvar %s %s %s %s\n", strings.Repeat("  ", a.varDepth), curName, v.Kind, v.Name, v.RealType)
+		fmt.Printf("%sprocessvar %s %s %s\n", strings.Repeat(" ", a.varDepth), v.Kind, v.Name, v.RealType)
 	}
-	if strings.HasPrefix(v.DwarfType.String(), "runtime.") {
-		return
+	s := v.DwarfType.String()
+	if strings.HasPrefix(s, "runtime.") || strings.HasPrefix(s, "*runtime.") {
+		return 0
 	}
-	if strings.HasPrefix(v.DwarfType.String(), "*sudog<") || strings.HasPrefix(v.DwarfType.String(), "*waitq<") {
-		return
+	if strings.HasPrefix(s, "*sudog<") || strings.HasPrefix(s, "*waitq<") {
+		return 0
 	}
 	// We've already seen this particular var.
 	//a.mu.RLock()
 	if a.mu.seen[v.Addr] {
+		a.mu.hitCount++
 		//a.mu.RUnlock()
-		return
+		return 0
 	}
 	//a.mu.RUnlock()
 	//a.mu.Lock()
-	counts := a.mu.objectMap[v.RealType]
+	counts := a.mu.objectMap[v.TypeString()]
 	if counts == nil {
 		counts = &objCounts{}
-		a.mu.objectMap[v.RealType] = counts
+		a.mu.objectMap[v.TypeString()] = counts
 	}
 	counts.count += 1
-	counts.size += v.RealType.Size()
+	size := v.RealType.Size()
+	if *debug {
+		fmt.Printf("%ssize: %d\n", strings.Repeat(" ", a.varDepth), size)
+	}
+	if size != math.MaxInt64 {
+		// Not sure why this happens sometimes?
+		counts.size += size
+	}
 	a.mu.seen[v.Addr] = true
 
 	// Scalars.
 	switch v.Kind {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return
+		return size
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return
+		return size
 	case reflect.Float64, reflect.Float32, reflect.Bool, reflect.Complex128, reflect.Complex64:
-		return
+		return size
 	}
 
+	retainedSize := a.getRetainedSize(v)
+	counts.retainedSize = retainedSize
+	return size + retainedSize
+}
+
+func (a *analyzer) getRetainedSize(v *proc.Variable) int64 {
 	//a.mu.Unlock()
+	var size int64
 
 	v.Load(proc.LoadConfig{
 		FollowPointers:     false,
 		MaxVariableRecurse: 0,
 		MaxStringLen:       0,
-		MaxArrayValues:     1000,
-		MaxStructFields:    math.MaxInt64,
-		MaxMapBuckets:      0,
+		// We'll load array values if we need to recurse into them down below.
+		MaxArrayValues:  0,
+		MaxStructFields: math.MaxInt64,
+		MaxMapBuckets:   0,
 	})
 
 	if v.Unreadable != nil {
 		if *debug {
-			fmt.Printf("unreadable var %s %s: %+v\n", curName, v.Unreadable.Error(), v)
+			fmt.Printf("unreadable var %s: %+v\n", v.Unreadable.Error(), v)
 		}
-		return
+		return 0
 	}
 
 	switch v.Kind {
-	case reflect.Slice, reflect.Array:
+	case reflect.Array:
+		t := v.RealType.(*godwarf.ArrayType)
+		elemType := t.Type
+		// Arrays already have their elements counted, so all we have to do
+		// is recurse inwards.
+		if _, ok := primitiveTypes[elemType.String()]; !ok {
+			v.Load(proc.LoadConfig{
+				MaxArrayValues: math.MaxInt64,
+			})
+			for _, c := range v.Children {
+				size += a.processVar(&c)
+			}
+		}
+	case reflect.Slice:
 		// Check if we've seen this array memory already. If not, recurse.
 		if a.mu.seen[v.Base] {
-			return
+			a.mu.hitCount++
+			return 0
 		}
 		a.mu.seen[v.Base] = true
-		var elemType godwarf.Type
-		switch t := v.RealType.(type) {
-		case *godwarf.SliceType:
-			elemType = t.ElemType
-		case *godwarf.ArrayType:
-			elemType = t.Type
-		}
+		styp := v.RealType.(*godwarf.SliceType)
+		elemType := styp.ElemType
+		elemCount := v.Cap
 		if _, ok := primitiveTypes[elemType.String()]; ok {
-			counts.size += elemType.Size() * v.Cap
+			elemSize := elemType.Size()
+			size += elemSize * elemCount
+			if *debug {
+				fmt.Printf("slice has size %s (%d * %s)\n",
+					humanize.Bytes(uint64(elemSize*elemCount)),
+					elemCount, humanize.Bytes(uint64(elemSize)))
+			}
 			// No need to recurse into primitive type arrays
-			return
-		}
-		for _, c := range v.Children {
-			a.processVar(fmt.Sprintf("*(*\"%s\")(%d)", v.RealType.String(), c.Addr), &c)
+		} else {
+			v.Load(proc.LoadConfig{
+				MaxArrayValues: math.MaxInt64,
+			})
+			for _, c := range v.Children {
+				size += a.processVar(&c)
+			}
 		}
 	case reflect.Ptr, reflect.UnsafePointer, reflect.Interface:
-		a.processVar(curName, &v.Children[0])
+		size += a.processVar(&v.Children[0])
 	case reflect.Struct:
 		if len(v.Children) != int(v.Len) {
 			panic(":(")
 		}
 		for _, c := range v.Children {
-			a.processVar(fmt.Sprintf("*(*\"%s\")(%d)", c.RealType, c.Addr), &c)
+			size += a.processVar(&c)
 		}
+		return size
 	case reflect.Map:
-		mtyp := v.DwarfType.(*godwarf.MapType)
+		v.Load(proc.LoadConfig{
+			MaxArrayValues: math.MaxInt64,
+		})
 		for i := 0; i < len(v.Children)/2; i++ {
 			key := v.Children[i*2]
 			val := v.Children[i*2+1]
 			//fmt.Println("processing parent")
-			a.processVar(fmt.Sprintf("*(*\"%s\")(%d)", mtyp.KeyType, key.Addr), &key)
+			size += a.processVar(&key)
 			//fmt.Println("processing child")
-			a.processVar(fmt.Sprintf("*(*\"%s\")(%d)", mtyp.ElemType, val.Addr), &val)
+			size += a.processVar(&val)
 		}
 
 	case reflect.Chan:
-		mtyp := v.DwarfType.(*godwarf.ChanType)
 		for _, c := range v.Children {
-
-			a.processVar(fmt.Sprintf("*(*\"%s\")(%d)", mtyp.ElemType, c.Addr), &c)
+			size += a.processVar(&c)
 		}
 	default:
 		if len(v.Children) > 0 {
 			fmt.Println("hmmmmmmmm", v.Children, v.Name, v.TypeString(), v.Kind)
 		}
 	}
+	return size
 }
