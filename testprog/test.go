@@ -12,6 +12,16 @@ package main
 
 import "fmt"
 
+var testVar = t{
+	p:  &p{},
+	ps: []p{p{}, p{}},
+}
+
+type ll struct {
+	val  int
+	next *ll
+}
+
 type p struct {
 	blah int
 }
@@ -27,6 +37,9 @@ type t struct {
 	ps      []p
 	pmap    map[int]p
 	ptrmap  map[int]*p
+	smap    map[p]ll
+	ll      ll
+	llPtr   *ll
 }
 
 func main() {
@@ -38,8 +51,11 @@ func main() {
 		ints:    []int{1, 2, 3, 4},
 		intsarr: [100]int{},
 		ps:      []p{{}, {}},
-		pmap:    nil,
-		ptrmap:  nil,
+		pmap:    map[int]p{1: {}, 2: {}},
+		ptrmap:  map[int]*p{1: {blah: 3}, 2: {blah: 4}},
+		ll:      ll{val: 0, next: &ll{val: 1, next: &ll{val: 2, next: &ll{val: 3}}}},
+		llPtr:   &ll{val: 0, next: &ll{val: 1, next: &ll{val: 2, next: &ll{val: 3}}}},
+		smap:    map[p]ll{{blah: 0}: {}, {blah: 10}: {}},
 	}
 	t.ints2 = t.ints[:]
 

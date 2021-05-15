@@ -11,6 +11,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"reflect"
 	"sort"
@@ -22,7 +23,10 @@ import (
 	"github.com/go-delve/delve/service/rpc2"
 )
 
+var debug = flag.Bool("debug", false, "debug")
+
 func main() {
+	flag.Parse()
 	// Create and start a terminal - attach to running instance
 	client := rpc2.NewClient("localhost:7070")
 	defer func(client *rpc2.RPCClient, cont bool) {
@@ -62,6 +66,8 @@ type analyzer struct {
 		// Map from string "type" to counts
 		objectMap map[string]*objCounts
 	}
+
+	varDepth int
 
 	frameIdx int
 	frame    *api.Stackframe
@@ -123,9 +129,29 @@ func (a *analyzer) analyze() error {
 	return nil
 }
 
+var primitiveTypes = map[string]struct{}{}
+
+func init() {
+	for _, s := range []string{
+		"int", "int64", "int32", "int16", "int8",
+		"uint", "uint64", "uint32", "uint16", "uint8",
+		"float64", "float32",
+	} {
+		primitiveTypes[s] = struct{}{}
+	}
+}
+
 // processVar recurses down a variable, processing it and any children.
 func (a *analyzer) processVar(curName string, v api.Variable) {
+	a.varDepth++
+	defer func() { a.varDepth-- }()
+	if *debug {
+		fmt.Printf("%sprocessvar %s %s %s %s\n", strings.Repeat("  ", a.varDepth), curName, v.Kind, v.Name, v.Type)
+	}
 	if strings.HasPrefix(v.RealType, "runtime.") {
+		return
+	}
+	if strings.HasPrefix(v.RealType, "*sudog<") || strings.HasPrefix(v.RealType, "*waitq<") {
 		return
 	}
 	// We've already seen this particular var.
@@ -146,11 +172,95 @@ func (a *analyzer) processVar(curName string, v api.Variable) {
 	a.mu.seen[v.Addr] = true
 	//a.mu.Unlock()
 
-	if v.Kind == reflect.Slice {
-		a.processVar(curName, *v.ArrayChild)
-	}
+	switch v.Kind {
+	case reflect.Slice:
+		if v.ArrayChild != nil {
+			a.processVar(curName, *v.ArrayChild)
+		}
+	case reflect.Ptr:
+		//fmt.Println("following pointer!", v.Name, v.Type)
+		innerV, err := a.client.EvalVariable(api.EvalScope{
+			GoroutineID: a.g.ID,
+			Frame:       a.frameIdx,
+		}, curName, api.LoadConfig{FollowPointers: true, MaxStructFields: -1})
+		if err != nil {
+			fmt.Println("ptr error", curName, err)
+			return
+		}
+		if len(innerV.Children) > 0 {
+			a.processVar(curName, innerV.Children[0])
+		}
+	case reflect.Struct:
+		if len(v.Children) != int(v.Len) {
+			// We need to Eval the struct.
+			v2, err := a.client.EvalVariable(api.EvalScope{
+				GoroutineID: a.g.ID,
+				Frame:       a.frameIdx,
+			}, curName, api.LoadConfig{FollowPointers: true, MaxStructFields: -1})
+			if err != nil {
+				fmt.Println("struct error", curName, err)
+				return
+			}
+			v = *v2
+		}
+		//fmt.Println("Following ", v.Kind.String(), v.Name, v.Type, len(v.Children))
+		for _, c := range v.Children {
+			//fmt.Println("Child", c.Name, c.Type)
+			a.processVar(fmt.Sprintf("*(*\"%s\")(%d)", c.RealType, c.Addr), c)
+		}
+	case reflect.Array:
+		//fmt.Printf("Evaluating array of type %+v\n", v)
+		if _, ok := primitiveTypes[v.ElemType]; ok {
+			// No need to recurse into primitive type arrays
+			return
+		}
+		v2, err := a.client.EvalVariable(api.EvalScope{
+			GoroutineID: a.g.ID,
+			Frame:       a.frameIdx,
+		}, curName, api.LoadConfig{FollowPointers: true, MaxStructFields: -1, MaxArrayValues: 100000})
+		if err != nil {
+			fmt.Println("error dereferencing array", curName, err)
+			return
+		}
+		for _, c := range v2.Children {
+			//fmt.Println("Child", c.Name, c.Type)
 
-	for _, c := range v.Children {
-		a.processVar(fmt.Sprintf("%s.%s", curName, c.Name), c)
+			a.processVar(fmt.Sprintf("*(*\"%s\")(%d)", v.ElemType, c.Addr), c)
+		}
+	case reflect.Map:
+		v2, err := a.client.EvalVariable(api.EvalScope{
+			GoroutineID: a.g.ID,
+			Frame:       a.frameIdx,
+		}, curName, api.LoadConfig{FollowPointers: true, MaxStructFields: -1, MaxArrayValues: 100000})
+		if err != nil {
+			fmt.Println("error dereffing map", curName, err)
+			return
+		}
+		for i := 0; i < len(v2.Children)/2; i++ {
+			key := v2.Children[i*2]
+			val := v2.Children[i*2+1]
+			//fmt.Println("processing parent")
+			a.processVar(fmt.Sprintf("*(*\"%s\")(%d)", v.KeyType, key.Addr), key)
+			//fmt.Println("processing child")
+			a.processVar(fmt.Sprintf("*(*\"%s\")(%d)", v.ElemType, val.Addr), val)
+		}
+
+	case reflect.Chan:
+		//fmt.Printf("Evaluating chan of type %+v\n", v)
+		v2, err := a.client.EvalVariable(api.EvalScope{
+			GoroutineID: a.g.ID,
+			Frame:       a.frameIdx,
+		}, curName, api.LoadConfig{FollowPointers: true, MaxStructFields: -1, MaxArrayValues: 100000})
+		if err != nil {
+			fmt.Println("chan error", curName, err)
+			return
+		}
+		for _, c := range v2.Children {
+			a.processVar(fmt.Sprintf("*(*\"%s\")(%d)", v.ElemType, c.Addr), c)
+		}
+	default:
+		for _, c := range v.Children {
+			a.processVar(fmt.Sprintf("%s.%s", curName, c.Name), c)
+		}
 	}
 }
