@@ -15,6 +15,7 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
 	"github.com/go-delve/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc/core"
 	"github.com/go-delve/delve/service/api"
 	"github.com/go-delve/delve/service/debugger"
 	"github.com/go-delve/delve/service/rpc2"
@@ -27,13 +28,25 @@ var goroutineid = flag.Int("goroutine", -1, "only analyze this goroutine id")
 func main() {
 	flag.Parse()
 	bin := flag.Arg(0)
-	core := flag.Arg(1)
+	coreFile := flag.Arg(1)
 	d, err := debugger.New(&debugger.Config{
-		CoreFile: core,
+		CoreFile: coreFile,
 	}, []string{bin})
 	if err != nil {
 		panic(err)
 	}
+
+	core, err := core.OpenCore(coreFile, bin, nil)
+	if err != nil {
+		panic(err)
+	}
+	scope, err := proc.ThreadScope(core.CurrentThread())
+	if err != nil {
+		panic(err)
+	}
+	scope.BinInfo.
+	pkgvars := make([]packageVar, len(scope.BinInfo.packageVars))
+	pv, err := scope.PackageVariables(proc.LoadConfig{})
 
 	var analyzer = analyzer{
 		debugger: d,
